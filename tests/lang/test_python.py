@@ -1843,3 +1843,29 @@ class TestTypeAnnotations:
             f"Expected animal.speak() -> Dog.speak (via parameter annotation), got CALLS: "
             f"{[(cpg.node(e.source).name, cpg.node(e.target).name) for e in calls_edges]}"
         )
+
+
+class TestRelativeImportParsing:
+    """Relative imports should store the dotted module with leading dots."""
+
+    def test_relative_import_stores_dot_prefix(self):
+        """from .sub import X should store module='.sub' in IMPORT attrs."""
+        init_src = b"""
+from .sub import helper
+"""
+        cpg = CPGBuilder().add_source(init_src, "pkg/__init__.py", "python").build()
+        imports = [n for n in cpg.nodes(kind=NodeKind.IMPORT) if n.attrs.get("is_from")]
+        assert len(imports) == 1
+        assert imports[0].attrs["module"] == ".sub", (
+            f"Expected '.sub', got {imports[0].attrs['module']!r}"
+        )
+
+    def test_double_dot_relative_import(self):
+        """from ..utils import X should store module='..utils'."""
+        src = b"""
+from ..utils import helper
+"""
+        cpg = CPGBuilder().add_source(src, "pkg/sub/mod.py", "python").build()
+        imports = [n for n in cpg.nodes(kind=NodeKind.IMPORT) if n.attrs.get("is_from")]
+        assert len(imports) == 1
+        assert imports[0].attrs["module"] == "..utils"

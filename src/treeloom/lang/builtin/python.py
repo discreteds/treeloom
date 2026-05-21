@@ -535,6 +535,12 @@ class PythonVisitor(TreeSitterVisitor):
             if child.type == "import":
                 saw_import = True
                 continue
+            if child.type == "relative_import":
+                # tree-sitter emits: relative_import → import_prefix ('.') + dotted_name
+                text = self._node_text(child, ctx.source)
+                if not saw_import:
+                    module_name = text
+                continue
             if child.type == "dotted_name":
                 text = self._node_text(child, ctx.source)
                 if not saw_import:
