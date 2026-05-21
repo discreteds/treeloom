@@ -1869,3 +1869,55 @@ from ..utils import helper
         imports = [n for n in cpg.nodes(kind=NodeKind.IMPORT) if n.attrs.get("is_from")]
         assert len(imports) == 1
         assert imports[0].attrs["module"] == "..utils"
+
+
+class TestQualifiedModuleNames:
+    """Module nodes should get dotted qualified names from package structure."""
+
+    def test_package_file_gets_qualified_name(self, tmp_path):
+        """pkg/sub/mod.py inside a package gets 'pkg.sub.mod'."""
+        pkg = tmp_path / "pkg"
+        sub = pkg / "sub"
+        sub.mkdir(parents=True)
+        (pkg / "__init__.py").write_bytes(b"")
+        (sub / "__init__.py").write_bytes(b"")
+        (sub / "mod.py").write_bytes(b"def foo(): pass\n")
+
+        cpg = CPGBuilder().add_file(sub / "mod.py").build()
+        mod = next(cpg.nodes(kind=NodeKind.MODULE))
+        assert mod.name == "pkg.sub.mod", f"Expected 'pkg.sub.mod', got {mod.name!r}"
+
+    def test_init_gets_package_name(self, tmp_path):
+        """pkg/__init__.py gets 'pkg', not '__init__'."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(b"def setup(): pass\n")
+
+        cpg = CPGBuilder().add_file(pkg / "__init__.py").build()
+        mod = next(cpg.nodes(kind=NodeKind.MODULE))
+        assert mod.name == "pkg", f"Expected 'pkg', got {mod.name!r}"
+
+    def test_standalone_file_keeps_stem(self, tmp_path):
+        """utils.py with no __init__.py in parent keeps 'utils'."""
+        (tmp_path / "utils.py").write_bytes(b"def helper(): pass\n")
+
+        cpg = CPGBuilder().add_file(tmp_path / "utils.py").build()
+        mod = next(cpg.nodes(kind=NodeKind.MODULE))
+        assert mod.name == "utils", f"Expected 'utils', got {mod.name!r}"
+
+    def test_virtual_file_falls_back_to_stem(self):
+        """add_source with virtual path falls back to file_path.stem."""
+        cpg = CPGBuilder().add_source(b"def f(): pass\n", "virtual.py", "python").build()
+        mod = next(cpg.nodes(kind=NodeKind.MODULE))
+        assert mod.name == "virtual"
+
+    def test_qualified_name_with_relative_root(self, tmp_path):
+        """Qualified names work correctly with relative_root set."""
+        pkg = tmp_path / "src" / "pkg"
+        pkg.mkdir(parents=True)
+        (tmp_path / "src" / "pkg" / "__init__.py").write_bytes(b"")
+        (pkg / "mod.py").write_bytes(b"def foo(): pass\n")
+
+        cpg = CPGBuilder(relative_root=tmp_path / "src").add_file(pkg / "mod.py").build()
+        mod = next(cpg.nodes(kind=NodeKind.MODULE))
+        assert mod.name == "pkg.mod", f"Expected 'pkg.mod', got {mod.name!r}"

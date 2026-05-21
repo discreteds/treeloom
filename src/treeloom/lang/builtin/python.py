@@ -53,6 +53,39 @@ class PythonVisitor(TreeSitterVisitor):
     def extensions(self) -> frozenset[str]:
         return frozenset({".py", ".pyi"})
 
+    @staticmethod
+    def _derive_qualified_module_name(file_path: Path) -> str:
+        """Derive a dotted module name from a file path.
+
+        Walks up the directory tree checking for __init__.py to find the
+        package root. Falls back to file_path.stem for non-package files
+        or virtual paths that don't exist on disk.
+        """
+        try:
+            resolved = file_path.resolve()
+        except (OSError, ValueError):
+            return file_path.stem
+
+        if not resolved.exists():
+            return file_path.stem
+
+        parts: list[str] = []
+        is_init = file_path.name == "__init__.py"
+
+        if not is_init:
+            parts.append(file_path.stem)
+
+        current = resolved.parent
+        while (current / "__init__.py").exists():
+            parts.append(current.name)
+            current = current.parent
+
+        if not parts:
+            return file_path.stem
+
+        parts.reverse()
+        return ".".join(parts)
+
     def visit(
         self, tree: Any, file_path: Path, emitter: NodeEmitter
     ) -> None:
@@ -61,8 +94,12 @@ class PythonVisitor(TreeSitterVisitor):
         source = root.text
 
         module_end = self._end_location(root, file_path)
+        # Prefer the original disk path (before relative-root normalization)
+        # for package-structure discovery; fall back to file_path if not available.
+        original_path = getattr(emitter, "_current_original_path", None) or file_path
+        module_name = self._derive_qualified_module_name(original_path)
         module_id = emitter.emit_module(
-            file_path.stem, file_path,
+            module_name, file_path,
             end_location=module_end,
         )
         ctx = _VisitContext(emitter=emitter, file_path=file_path, source=source)
