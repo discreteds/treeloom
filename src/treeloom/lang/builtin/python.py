@@ -142,17 +142,49 @@ class PythonVisitor(TreeSitterVisitor):
             if scope is not None and scope.kind == NodeKind.CLASS:
                 method_index[(scope.name, fn.name)] = fn
 
-        # Build import map: local_name -> (module_name, original_name)
-        # This lets us resolve calls to imported functions by finding them
-        # in the CPG under their original module scope.
-        import_map: dict[str, tuple[str, str]] = {}
+        # -- Per-file import maps ----------------------------------------
+        file_import_maps: dict[str, dict[str, tuple[str, str | None]]] = {}
+        module_imports: dict[NodeId, list[CpgNode]] = {}
         for imp_node in cpg.nodes(kind=NodeKind.IMPORT):
+            # Per-file import map
+            file_key = str(imp_node.location.file) if imp_node.location else ""
+            if file_key not in file_import_maps:
+                file_import_maps[file_key] = {}
+            fmap = file_import_maps[file_key]
+
             if imp_node.attrs.get("is_from"):
                 module = imp_node.attrs.get("module", "")
                 for imp_name in imp_node.attrs.get("names", []):
                     aliases = imp_node.attrs.get("aliases") or {}
                     local = aliases.get(imp_name, imp_name)
-                    import_map[local] = (module, imp_name)
+                    fmap[local] = (module, imp_name)
+            else:
+                for name in imp_node.attrs.get("names", []):
+                    aliases = imp_node.attrs.get("aliases") or {}
+                    local = aliases.get(name, name)
+                    fmap[local] = (name, None)
+                    if "." in name and name not in aliases:
+                        parts = name.split(".")
+                        for i in range(1, len(parts)):
+                            prefix = ".".join(parts[:i])
+                            fmap.setdefault(prefix, (prefix, None))
+
+            # Module-scoped import index
+            scope_node = cpg.scope_of(imp_node.id)
+            if scope_node is not None:
+                module_imports.setdefault(scope_node.id, []).append(imp_node)
+
+        # Symbol index: functions + classes
+        symbols: dict[str, list[CpgNode]] = {}
+        for n in fn_list:
+            symbols.setdefault(n.name, []).append(n)
+        for n in cpg.nodes(kind=NodeKind.CLASS):
+            symbols.setdefault(n.name, []).append(n)
+
+        # Module name index
+        module_index: dict[str, CpgNode] = {}
+        for n in cpg.nodes(kind=NodeKind.MODULE):
+            module_index[n.name] = n
 
         resolved: list[tuple[NodeId, NodeId]] = []
 
@@ -169,32 +201,79 @@ class PythonVisitor(TreeSitterVisitor):
                     method_index, class_nodes,
                 )
 
-            # Fall back to name-based resolution
-            if fn is None:
+            # Per-file import map for this call's file
+            call_file = str(call_node.location.file) if call_node.location else ""
+            call_import_map = file_import_maps.get(call_file, {})
+
+            is_import_known = (
+                target in call_import_map
+                or ("." in target and target.split(".")[0] in call_import_map)
+            )
+
+            # Name-based fallback — guarded
+            if fn is None and not is_import_known:
                 fn = self._resolve_single_call(
                     call_node, target, functions, cpg,
                 )
 
-            if fn is None and "." in target:
+            if fn is None and not is_import_known and "." in target:
                 short_name = target.rsplit(".", 1)[-1]
                 fn = self._resolve_single_call(
                     call_node, short_name, functions, cpg,
                 )
 
-            # Try import-following: if the call target was imported, look
-            # for the function in the source module's scope
-            if fn is None and target in import_map:
-                imp_module, imp_name = import_map[target]
-                # Find candidates with the original name scoped in the right module
-                imp_candidates = functions.get(imp_name, [])
-                for candidate in imp_candidates:
-                    scope = cpg.scope_of(candidate.id)
-                    if scope is not None and scope.kind == NodeKind.MODULE:
-                        # Match module name (stem, e.g. "utils" matches "utils.py")
-                        mod_parts = imp_module.rsplit(".", 1)
-                        if scope.name == imp_module or scope.name in mod_parts:
-                            fn = candidate
+            # Import-following resolution
+            if fn is None:
+                imp_entry = call_import_map.get(target)
+                base_method: str | None = None
+
+                # Longest-prefix lookup for dotted calls
+                if imp_entry is None and "." in target:
+                    parts = target.split(".")
+                    for i in range(len(parts) - 1, 0, -1):
+                        prefix = ".".join(parts[:i])
+                        imp_entry = call_import_map.get(prefix)
+                        if imp_entry is not None:
+                            remaining = parts[i:]
+                            if len(remaining) == 1:
+                                base_method = remaining[0]
+                            else:
+                                imp_entry = None
                             break
+
+                if imp_entry is not None:
+                    imp_module, imp_name = imp_entry
+
+                    if imp_name is not None:
+                        # From-import: search for symbol in exact module
+                        imp_candidates = symbols.get(imp_name, [])
+                        imp_mod_parts = imp_module.rsplit(".", 1)
+                        for candidate in imp_candidates:
+                            scope = cpg.scope_of(candidate.id)
+                            if scope is not None and scope.kind == NodeKind.MODULE:
+                                if scope.name == imp_module or scope.name in imp_mod_parts:
+                                    fn = candidate
+                                    break
+                        if fn is None:
+                            fn = self._follow_reexport(
+                                cpg, imp_module, imp_name, symbols,
+                                module_imports, module_index,
+                            )
+                    elif base_method is not None:
+                        # Module import: search for method in exact module
+                        candidates = symbols.get(base_method, [])
+                        imp_mod_parts = imp_module.rsplit(".", 1)
+                        for candidate in candidates:
+                            scope = cpg.scope_of(candidate.id)
+                            if scope is not None and scope.kind == NodeKind.MODULE:
+                                if scope.name == imp_module or scope.name in imp_mod_parts:
+                                    fn = candidate
+                                    break
+                        if fn is None:
+                            fn = self._follow_reexport(
+                                cpg, imp_module, base_method, symbols,
+                                module_imports, module_index,
+                            )
 
             if fn is not None:
                 cpg.add_edge(_make_calls_edge(call_node.id, fn.id))
@@ -262,6 +341,22 @@ class PythonVisitor(TreeSitterVisitor):
 
         # Fall back to first match (best-effort)
         return candidates[0]
+
+    @staticmethod
+    def _follow_reexport(
+        cpg: CodePropertyGraph,
+        module_name: str,
+        symbol_name: str,
+        symbols: dict[str, list[CpgNode]],
+        module_imports: dict[NodeId, list[CpgNode]],
+        module_index: dict[str, CpgNode],
+        _depth: int = 0,
+    ) -> CpgNode | None:
+        """Follow re-export chains to find a symbol's definition.
+
+        Stub — full implementation in Task 4.
+        """
+        return None
 
     # -- Private visit dispatch -----------------------------------------------
 

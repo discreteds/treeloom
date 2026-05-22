@@ -1921,3 +1921,149 @@ class TestQualifiedModuleNames:
         cpg = CPGBuilder(relative_root=tmp_path / "src").add_file(pkg / "mod.py").build()
         mod = next(cpg.nodes(kind=NodeKind.MODULE))
         assert mod.name == "pkg.mod", f"Expected 'pkg.mod', got {mod.name!r}"
+
+
+class TestPerFileImportMap:
+    """Import-based call resolution should be scoped per file."""
+
+    def test_alias_suppresses_name_based(self):
+        """ml.lit() should NOT match internal lit() in a different module."""
+        lib_src = b"""
+def lit(value):
+    return value
+"""
+        internal_src = b"""
+def lit(x):
+    return x * 2
+"""
+        consumer_src = b"""
+import mylib as ml
+
+def process():
+    return ml.lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(internal_src, "internal.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        # ml.lit should resolve to mylib.lit, NOT internal.lit
+        resolved_targets = [t for s, t in calls_edges if "lit" in s]
+        if resolved_targets:
+            edge = next(
+                e for e in cpg.edges(kind=EdgeKind.CALLS)
+                if cpg.node(e.source) and "lit" in cpg.node(e.source).name
+            )
+            target = cpg.node(edge.target)
+            target_scope = cpg.scope_of(target.id)
+            assert target_scope.name == "mylib", (
+                f"Expected target in 'mylib', got {target_scope.name!r}"
+            )
+
+    def test_per_file_isolation(self):
+        """Import in a.py should not affect resolution in b.py."""
+        lib_src = b"""
+def foo():
+    return 1
+"""
+        a_src = b"""
+import mylib as ml
+
+def call_a():
+    return ml.foo()
+"""
+        b_src = b"""
+def ml():
+    return 'local'
+
+def call_b():
+    return ml()
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(a_src, "a.py", "python")
+            .add_source(b_src, "b.py", "python")
+            .build()
+        )
+        # b.py's ml() should resolve via name-based to b.py's ml function
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        b_calls = [
+            (s, t) for s, t in calls_edges
+            if s == "ml" and t == "ml"
+        ]
+        assert len(b_calls) >= 1, (
+            f"b.py's ml() should resolve to local ml, got: {calls_edges}"
+        )
+
+    def test_from_import_suppresses_name_based(self):
+        """from pkg import lit; lit() should not match internal lit()."""
+        pkg_src = b"""
+def lit(value):
+    return value
+"""
+        internal_src = b"""
+def lit(x):
+    return x * 2
+"""
+        consumer_src = b"""
+from mypkg import lit
+
+def process():
+    return lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(pkg_src, "mypkg.py", "python")
+            .add_source(internal_src, "internal.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        lit_targets = [t for s, t in calls_edges if s == "lit"]
+        if lit_targets:
+            edge = next(
+                e for e in cpg.edges(kind=EdgeKind.CALLS)
+                if cpg.node(e.source) and cpg.node(e.source).name == "lit"
+                and cpg.node(e.source).kind == NodeKind.CALL
+            )
+            target = cpg.node(edge.target)
+            target_scope = cpg.scope_of(target.id)
+            assert target_scope.name == "mypkg", (
+                f"Expected target in 'mypkg', got {target_scope.name!r}"
+            )
+
+    def test_short_name_fallback_also_suppressed(self):
+        """pl.lit should not match internal lit() via short-name strip."""
+        lib_src = b"""
+def lit(value):
+    return value
+"""
+        internal_src = b"""
+def lit(x):
+    return x * 2
+"""
+        consumer_src = b"""
+import mylib as ml
+
+def process():
+    return ml.lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(internal_src, "internal.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        for edge in cpg.edges(kind=EdgeKind.CALLS):
+            src = cpg.node(edge.source)
+            tgt = cpg.node(edge.target)
+            if src and "lit" in src.name:
+                tgt_scope = cpg.scope_of(tgt.id)
+                assert tgt_scope is None or tgt_scope.name != "internal", (
+                    f"ml.lit falsely resolved to internal.lit via short-name fallback"
+                )
