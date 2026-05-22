@@ -244,6 +244,28 @@ class PythonVisitor(TreeSitterVisitor):
                 if imp_entry is not None:
                     imp_module, imp_name = imp_entry
 
+                    # Resolve relative imports to absolute module names
+                    if imp_module.startswith("."):
+                        # Find the module containing this call
+                        call_scope = call_node
+                        calling_module: CpgNode | None = None
+                        while call_scope is not None:
+                            parent = cpg.scope_of(call_scope.id)
+                            if parent is not None and parent.kind == NodeKind.MODULE:
+                                calling_module = parent
+                                break
+                            call_scope = parent
+                        if calling_module is not None:
+                            is_pkg = (
+                                calling_module.location is not None
+                                and str(calling_module.location.file).endswith(
+                                    "__init__.py"
+                                )
+                            )
+                            imp_module = self._resolve_relative_import(
+                                calling_module.name, imp_module, is_package=is_pkg
+                            )
+
                     if imp_name is not None:
                         # From-import: search for symbol in exact module
                         imp_candidates = symbols.get(imp_name, [])
@@ -343,7 +365,12 @@ class PythonVisitor(TreeSitterVisitor):
         return candidates[0]
 
     @staticmethod
+    def _is_submodule(name: str, parent: str) -> bool:
+        """Check if name is a submodule of parent."""
+        return name.startswith(parent + ".")
+
     def _follow_reexport(
+        self,
         cpg: CodePropertyGraph,
         module_name: str,
         symbol_name: str,
@@ -352,11 +379,62 @@ class PythonVisitor(TreeSitterVisitor):
         module_index: dict[str, CpgNode],
         _depth: int = 0,
     ) -> CpgNode | None:
-        """Follow re-export chains to find a symbol's definition.
+        """Follow __init__.py re-exports to find the actual definition."""
+        if _depth >= 3:
+            return None
 
-        Stub — full implementation in Task 4.
-        """
+        module_node = module_index.get(module_name)
+        if module_node is None:
+            return None
+
+        for imp in module_imports.get(module_node.id, []):
+            if not imp.attrs.get("is_from"):
+                continue
+            source_module = imp.attrs.get("module", "")
+
+            if source_module.startswith("."):
+                is_pkg = (
+                    module_node.location is not None
+                    and str(module_node.location.file).endswith("__init__.py")
+                )
+                source_module = self._resolve_relative_import(
+                    module_name, source_module, is_package=is_pkg
+                )
+
+            names = imp.attrs.get("names", [])
+            aliases = imp.attrs.get("aliases") or {}
+            for name in names:
+                local = aliases.get(name, name)
+                if local == symbol_name or name == symbol_name:
+                    candidates = symbols.get(name, [])
+                    for candidate in candidates:
+                        scope = cpg.scope_of(candidate.id)
+                        if scope and scope.kind == NodeKind.MODULE:
+                            if (scope.name == source_module
+                                    or self._is_submodule(scope.name, source_module)):
+                                return candidate
+                    result = self._follow_reexport(
+                        cpg, source_module, name, symbols,
+                        module_imports, module_index, _depth + 1,
+                    )
+                    if result is not None:
+                        return result
         return None
+
+    @staticmethod
+    def _resolve_relative_import(
+        importing_module: str, relative_module: str, is_package: bool
+    ) -> str:
+        """Resolve a relative import against the importing module's name."""
+        dots = len(relative_module) - len(relative_module.lstrip("."))
+        suffix = relative_module.lstrip(".")
+        parts = importing_module.split(".")
+        if not is_package and parts:
+            parts = parts[:-1]
+        base_parts = parts[: max(0, len(parts) - (dots - 1))]
+        if suffix:
+            base_parts.append(suffix)
+        return ".".join(base_parts)
 
     # -- Private visit dispatch -----------------------------------------------
 

@@ -2256,3 +2256,194 @@ def process():
         assert not false_matches, (
             f"pkg.sub.func() should stay unresolved, got: {false_matches}"
         )
+
+
+class TestReexportFollowing:
+    """Re-exports through __init__.py should be followed."""
+
+    def test_reexport_resolution(self, tmp_path):
+        """from pkg import Foo where Foo is in pkg/sub/impl.py."""
+        pkg = tmp_path / "pkg"
+        sub = pkg / "sub"
+        sub.mkdir(parents=True)
+        (pkg / "__init__.py").write_bytes(b"from pkg.sub.impl import Foo\n")
+        (sub / "__init__.py").write_bytes(b"")
+        (sub / "impl.py").write_bytes(b"def Foo(): return 1\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(b"from pkg import Foo\n\ndef main():\n    return Foo()\n")
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("Foo", "Foo") in calls_edges
+
+        # Verify target is in pkg.sub.impl, not pkg
+        for edge in cpg.edges(kind=EdgeKind.CALLS):
+            src = cpg.node(edge.source)
+            tgt = cpg.node(edge.target)
+            if src and src.name == "Foo" and src.kind == NodeKind.CALL:
+                tgt_scope = cpg.scope_of(tgt.id)
+                assert tgt_scope is not None
+                assert "impl" in tgt_scope.name, (
+                    f"Expected target in pkg.sub.impl, got {tgt_scope.name!r}"
+                )
+
+    def test_reexport_with_alias(self, tmp_path):
+        """pkg/__init__.py: from pkg.internal import _Impl as PublicName."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(
+            b"from pkg.internal import _Impl as PublicName\n"
+        )
+        (pkg / "internal.py").write_bytes(b"def _Impl(): return 1\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from pkg import PublicName\n\ndef main():\n    return PublicName()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("PublicName", "_Impl") in calls_edges
+
+    def test_reexported_class_resolves(self, tmp_path):
+        """from pkg import MyClass; MyClass() → CLASS node."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(b"from pkg.impl import MyClass\n")
+        (pkg / "impl.py").write_bytes(b"class MyClass:\n    pass\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from pkg import MyClass\n\ndef main():\n    return MyClass()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        for edge in cpg.edges(kind=EdgeKind.CALLS):
+            src = cpg.node(edge.source)
+            tgt = cpg.node(edge.target)
+            if src and src.name == "MyClass" and src.kind == NodeKind.CALL:
+                assert tgt.kind == NodeKind.CLASS, (
+                    f"Expected CLASS node, got {tgt.kind}"
+                )
+                break
+        else:
+            pytest.fail("MyClass() call was not resolved")
+
+    def test_relative_reexport(self, tmp_path):
+        """__init__.py: from .sub import helper — relative re-export."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(b"from .sub import helper\n")
+        (pkg / "sub.py").write_bytes(b"def helper(): return 1\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from pkg import helper\n\ndef main():\n    return helper()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("helper", "helper") in calls_edges
+
+    def test_relative_import_from_non_init(self, tmp_path):
+        """pkg/mod.py: from .sibling import helper — non-package relative."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(b"")
+        (pkg / "sibling.py").write_bytes(b"def helper(): return 1\n")
+        (pkg / "mod.py").write_bytes(
+            b"from .sibling import helper\n\ndef main():\n    return helper()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("helper", "helper") in calls_edges
+
+        # Verify target is in pkg.sibling
+        for edge in cpg.edges(kind=EdgeKind.CALLS):
+            src = cpg.node(edge.source)
+            tgt = cpg.node(edge.target)
+            if src and src.name == "helper" and src.kind == NodeKind.CALL:
+                tgt_scope = cpg.scope_of(tgt.id)
+                assert tgt_scope is not None and "sibling" in tgt_scope.name
+
+    def test_chained_reexport(self, tmp_path):
+        """a/__init__.py → a/b/__init__.py → a/b/c.py — 2 levels."""
+        a = tmp_path / "a"
+        b = a / "b"
+        b.mkdir(parents=True)
+        (a / "__init__.py").write_bytes(b"from a.b import deep_func\n")
+        (b / "__init__.py").write_bytes(b"from a.b.c import deep_func\n")
+        (b / "c.py").write_bytes(b"def deep_func(): return 1\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from a import deep_func\n\ndef main():\n    return deep_func()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("deep_func", "deep_func") in calls_edges
+
+    def test_recursion_limit(self, tmp_path):
+        """4-level chain: a → b → c → d. Level 4 should NOT resolve."""
+        a = tmp_path / "a"
+        b = a / "b"
+        c = b / "c"
+        d = c / "d"
+        d.mkdir(parents=True)
+        (a / "__init__.py").write_bytes(b"from a.b import deep\n")
+        (b / "__init__.py").write_bytes(b"from a.b.c import deep\n")
+        (c / "__init__.py").write_bytes(b"from a.b.c.d import deep\n")
+        (d / "__init__.py").write_bytes(b"from a.b.c.d.e import deep\n")
+        # No e module — chain exceeds depth 3
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from a import deep\n\ndef main():\n    return deep()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        deep_resolved = [(s, t) for s, t in calls_edges if "deep" in s]
+        assert not deep_resolved, (
+            f"4-level chain should not resolve, got: {deep_resolved}"
+        )
+
+    def test_alternative_reexport_path(self, tmp_path):
+        """Two re-export paths for same symbol — first fails, second succeeds."""
+        pkg = tmp_path / "mypkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(
+            b"from mypkg.missing import Widget\nfrom mypkg.real import Widget\n"
+        )
+        (pkg / "real.py").write_bytes(b"def Widget():\n    return 1\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from mypkg import Widget\n\ndef main():\n    return Widget()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("Widget", "Widget") in calls_edges
+
+    def test_direct_search_no_submodule_bypass(self, tmp_path):
+        """from pkg import Foo where Foo is in pkg.internal but NOT re-exported."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(b"# does NOT re-export Foo\n")
+        (pkg / "internal.py").write_bytes(b"def Foo(): return 1\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from pkg import Foo\n\ndef main():\n    return Foo()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        foo_resolved = [(s, t) for s, t in calls_edges if "Foo" in s]
+        assert not foo_resolved, (
+            f"Foo should NOT resolve (not re-exported), got: {foo_resolved}"
+        )
