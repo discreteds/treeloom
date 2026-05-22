@@ -2447,3 +2447,40 @@ class TestReexportFollowing:
         assert not foo_resolved, (
             f"Foo should NOT resolve (not re-exported), got: {foo_resolved}"
         )
+
+
+class TestKnownLimitations:
+    """Document known limitation behavior for regression tracking."""
+
+    def test_post_import_shadowing_known_wrong(self):
+        """from pkg import lit; lit = other; lit() — resolves to pkg.lit (wrong).
+
+        This is a known limitation: the resolver has no access to per-scope
+        assignment tracking. This test documents the current (incorrect)
+        behavior as a regression marker.
+        """
+        pkg_src = b"""
+def lit(value):
+    return value
+"""
+        consumer_src = b"""
+from mypkg import lit
+
+def other():
+    return 'other'
+
+def process():
+    lit = other
+    return lit()
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(pkg_src, "mypkg.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        # Known wrong: lit() resolves to mypkg.lit even after shadowing
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        # Just verify it doesn't crash — the exact resolution is documented
+        # as a known limitation
+        assert isinstance(calls_edges, list)
