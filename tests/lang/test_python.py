@@ -2067,3 +2067,192 @@ def process():
                 assert tgt_scope is None or tgt_scope.name != "internal", (
                     f"ml.lit falsely resolved to internal.lit via short-name fallback"
                 )
+
+
+class TestModuleImportResolution:
+    """Tests for import X as alias; alias.method() resolution."""
+
+    def test_alias_resolves_via_import_following(self):
+        """ml.lit() → CALLS edge to lit() in mylib module."""
+        lib_src = b"""
+def lit(value):
+    return value
+"""
+        consumer_src = b"""
+import mylib as ml
+
+def process():
+    return ml.lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("ml.lit", "lit") in calls_edges, (
+            f"Expected ml.lit -> lit, got: {calls_edges}"
+        )
+
+    def test_unaliased_import_resolves(self):
+        """import mylib; mylib.lit() also resolves correctly."""
+        lib_src = b"""
+def lit(value):
+    return value
+"""
+        consumer_src = b"""
+import mylib
+
+def process():
+    return mylib.lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("mylib.lit", "lit") in calls_edges, (
+            f"Expected mylib.lit -> lit, got: {calls_edges}"
+        )
+
+    def test_from_import_still_works(self):
+        """from mylib import lit; lit() — existing behavior unchanged."""
+        lib_src = b"""
+def lit(value):
+    return value
+"""
+        consumer_src = b"""
+from mylib import lit
+
+def process():
+    return lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("lit", "lit") in calls_edges
+
+    def test_mixed_imports_resolve(self):
+        """Both import styles in same file resolve correctly."""
+        lib_a_src = b"""
+def foo():
+    return 1
+"""
+        lib_b_src = b"""
+def bar():
+    return 2
+"""
+        consumer_src = b"""
+import lib_a as a
+from lib_b import bar
+
+def process():
+    x = a.foo()
+    y = bar()
+    return x + y
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_a_src, "lib_a.py", "python")
+            .add_source(lib_b_src, "lib_b.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("a.foo", "foo") in calls_edges
+        assert ("bar", "bar") in calls_edges
+
+    def test_no_false_cross_resolution(self):
+        """Two modules with same function name — correct one resolved."""
+        lib_src = b"""
+def lit(value):
+    return value
+"""
+        other_src = b"""
+def lit(x):
+    return x * 2
+"""
+        consumer_src = b"""
+import mylib as ml
+
+def process():
+    return ml.lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(other_src, "other.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        for edge in cpg.edges(kind=EdgeKind.CALLS):
+            src = cpg.node(edge.source)
+            tgt = cpg.node(edge.target)
+            if src and "lit" in src.name:
+                tgt_scope = cpg.scope_of(tgt.id)
+                assert tgt_scope is not None and tgt_scope.name == "mylib", (
+                    f"ml.lit should resolve to mylib, got {tgt_scope.name if tgt_scope else '?'}"
+                )
+
+    def test_dotted_bare_import_prefix_registration(self):
+        """import os.path; os.path.join() — all prefixes registered in import map."""
+        consumer_src = b"""
+import os.path
+
+def process():
+    return os.path.join('a', 'b')
+"""
+        # A module named 'join' (not 'os', not 'path', not 'os.path') should NOT
+        # be resolved via name-based fallback for the os.path.join call.
+        unrelated_src = b"""
+def join(*args):
+    return args
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(consumer_src, "consumer.py", "python")
+            .add_source(unrelated_src, "myutils.py", "python")
+            .build()
+        )
+        # os.path.join is protected by is_import_known guard (prefix 'os' in import map).
+        # Name-based fallback to myutils.join should be suppressed.
+        for edge in cpg.edges(kind=EdgeKind.CALLS):
+            src = cpg.node(edge.source)
+            if src and src.name == "os.path.join":
+                tgt = cpg.node(edge.target)
+                tgt_scope = cpg.scope_of(tgt.id) if tgt else None
+                assert tgt_scope is None or tgt_scope.name != "myutils", (
+                    "os.path.join falsely resolved to myutils.join via name-based"
+                )
+
+    def test_multi_level_stays_unresolved(self):
+        """import pkg.sub; pkg.sub.func() with too many levels stays unresolved."""
+        lib_src = b"""
+def sub():
+    return 'wrong'
+"""
+        consumer_src = b"""
+import pkg.sub
+
+def process():
+    return pkg.sub.func()
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "pkg.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        # pkg.sub.func has 2 segments past "pkg" — should NOT resolve
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        false_matches = [(s, t) for s, t in calls_edges if "sub" in s.lower() or "func" in s.lower()]
+        assert not false_matches, (
+            f"pkg.sub.func() should stay unresolved, got: {false_matches}"
+        )
