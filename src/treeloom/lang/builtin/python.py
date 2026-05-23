@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,53 @@ _LITERAL_TYPES: dict[str, str] = {
     "none": "none",
     "concatenated_string": "str",
 }
+
+
+_OPTIONAL_RE = re.compile(r"^Optional\[(.+)\]$")
+_UNION_RE = re.compile(r"^Union\[(.+)\]$")
+
+
+def _unwrap_receiver_type(type_str: str) -> list[str]:
+    """Extract candidate class names from a type annotation for MRO resolution.
+
+    Unwraps Optional[X] and Union[X, None] to their concrete types.
+    Does NOT unwrap container generics (List[X], Dict[K, V]) — method calls
+    on containers target the container, not the element type.
+    """
+    # Optional[X] -> [X]
+    m = _OPTIONAL_RE.match(type_str)
+    if m:
+        return [m.group(1)]
+
+    # X | None or None | X (PEP 604)
+    if "|" in type_str:
+        parts = [p.strip() for p in type_str.split("|")]
+        return [p for p in parts if p != "None"]
+
+    # Union[X, Y, None] -> [X, Y]
+    m = _UNION_RE.match(type_str)
+    if m:
+        parts = _split_type_args(m.group(1))
+        return [p.strip() for p in parts if p.strip() != "None"]
+
+    return [type_str]
+
+
+def _split_type_args(args_str: str) -> list[str]:
+    """Split comma-separated type arguments, respecting bracket nesting."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(args_str):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(args_str[start:i])
+            start = i + 1
+    parts.append(args_str[start:])
+    return parts
 
 
 class PythonVisitor(TreeSitterVisitor):
@@ -188,10 +236,13 @@ class PythonVisitor(TreeSitterVisitor):
             receiver_type = call_node.attrs.get("receiver_inferred_type")
             if receiver_type is not None and "." in target:
                 method_name = target.rsplit(".", 1)[-1]
-                fn = self._resolve_method_via_mro(
-                    receiver_type, method_name,
-                    method_index, class_nodes,
-                )
+                for candidate_type in _unwrap_receiver_type(receiver_type):
+                    fn = self._resolve_method_via_mro(
+                        candidate_type, method_name,
+                        method_index, class_nodes,
+                    )
+                    if fn is not None:
+                        break
 
             # Per-file import map for this call's file
             call_file = str(call_node.location.file) if call_node.location else ""

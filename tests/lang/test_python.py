@@ -1844,6 +1844,95 @@ class TestTypeAnnotations:
             f"{[(cpg.node(e.source).name, cpg.node(e.target).name) for e in calls_edges]}"
         )
 
+    def _assert_animal_speak_resolves_to_dog(self, cpg, caller_func_name: str):
+        """Helper: animal.speak() inside the given function should resolve to Dog.speak."""
+        dog_class = next(n for n in cpg.nodes(kind=NodeKind.CLASS) if n.name == "Dog")
+        dog_speak = next(
+            n for n in cpg.nodes(kind=NodeKind.FUNCTION)
+            if n.name == "speak" and n.scope == dog_class.id
+        )
+        # Find the animal.speak call scoped to the target function
+        caller_fn = next(
+            n for n in cpg.nodes(kind=NodeKind.FUNCTION) if n.name == caller_func_name
+        )
+        animal_speak_calls = [
+            n for n in cpg.nodes(kind=NodeKind.CALL)
+            if n.name == "animal.speak" and n.scope == caller_fn.id
+        ]
+        assert animal_speak_calls, f"Expected 'animal.speak' call in {caller_func_name}()"
+        calls_edges = list(cpg.edges(kind=EdgeKind.CALLS))
+        assert any(
+            e.source == animal_speak_calls[0].id and e.target == dog_speak.id
+            for e in calls_edges
+        ), (
+            f"Expected animal.speak() in {caller_func_name}() -> Dog.speak, "
+            f"got CALLS: {[(cpg.node(e.source).name, cpg.node(e.target).name) for e in calls_edges]}"
+        )
+
+    def test_optional_bracket_resolves_method(self, cpg):
+        """Optional[Dog] parameter should resolve animal.speak() to Dog.speak."""
+        self._assert_animal_speak_resolves_to_dog(cpg, "optional_bracket")
+
+    def test_optional_pipe_resolves_method(self, cpg):
+        """Dog | None parameter should resolve animal.speak() to Dog.speak."""
+        self._assert_animal_speak_resolves_to_dog(cpg, "optional_pipe")
+
+    def test_union_with_none_resolves_method(self, cpg):
+        """Union[Dog, None] parameter should resolve animal.speak() to Dog.speak."""
+        self._assert_animal_speak_resolves_to_dog(cpg, "union_with_none")
+
+    def test_union_two_types_resolves_first_match(self, cpg):
+        """Union[Dog, Cat] should try both and resolve to first MRO hit (Dog.speak)."""
+        self._assert_animal_speak_resolves_to_dog(cpg, "union_two_types")
+
+
+class TestGenericTypeUnwrappingForMRO:
+    """When two classes share a method name, MRO resolution must unwrap
+    generic types (Optional[X], Union[X, None]) to find the correct class."""
+
+    @pytest.fixture()
+    def cpg(self):
+        return _build("generic_type_resolution.py")
+
+    def _assert_start_resolves_to_engine(self, cpg, caller_func_name: str):
+        engine_class = next(n for n in cpg.nodes(kind=NodeKind.CLASS) if n.name == "Engine")
+        engine_start = next(
+            n for n in cpg.nodes(kind=NodeKind.FUNCTION)
+            if n.name == "start" and n.scope == engine_class.id
+        )
+        caller_fn = next(
+            n for n in cpg.nodes(kind=NodeKind.FUNCTION) if n.name == caller_func_name
+        )
+        start_calls = [
+            n for n in cpg.nodes(kind=NodeKind.CALL)
+            if n.name.endswith(".start") and n.scope == caller_fn.id
+        ]
+        assert start_calls, f"Expected a .start() call in {caller_func_name}()"
+        calls_edges = list(cpg.edges(kind=EdgeKind.CALLS))
+        assert any(
+            e.source == start_calls[0].id and e.target == engine_start.id
+            for e in calls_edges
+        ), (
+            f"Expected .start() in {caller_func_name}() -> Engine.start, "
+            f"got CALLS: {[(cpg.node(e.source).name, cpg.node(e.target).name) for e in calls_edges]}"
+        )
+
+    def test_optional_bracket_unwraps_for_mro(self, cpg):
+        """Optional[Engine] should unwrap to Engine for MRO resolution."""
+        self._assert_start_resolves_to_engine(cpg, "with_optional")
+
+    def test_pipe_none_unwraps_for_mro(self, cpg):
+        """Engine | None should unwrap to Engine for MRO resolution."""
+        self._assert_start_resolves_to_engine(cpg, "with_pipe_none")
+
+    def test_union_none_unwraps_for_mro(self, cpg):
+        """Union[Engine, None] should unwrap to Engine for MRO resolution."""
+        self._assert_start_resolves_to_engine(cpg, "with_union_none")
+
+    def test_union_two_types_tries_first(self, cpg):
+        """Union[Engine, Server] should try Engine first and resolve .start() there."""
+        self._assert_start_resolves_to_engine(cpg, "with_union_two")
+
 
 class TestUnionTypeAnnotationPreservation:
     """Generic type annotations (Union[X, Y], Optional[X], Dict[K, V]) must
