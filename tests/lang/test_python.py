@@ -1793,14 +1793,14 @@ class TestTypeAnnotations:
             f"Expected inferred_type='int' on 'count', got: {[v.attrs for v in count_vars]}"
         )
 
-    def test_annotated_generic_type_stripped(self, cpg):
-        """items: list[str] = [] should emit inferred_type='list' (generic stripped)."""
+    def test_annotated_generic_type_preserved(self, cpg):
+        """items: list[str] = [] should preserve full generic type."""
         items_vars = [n for n in cpg.nodes(kind=NodeKind.VARIABLE) if n.name == "items"]
         assert items_vars, "Expected a variable named 'items'"
         assert any(
-            v.attrs.get("inferred_type") == "list" for v in items_vars
+            v.attrs.get("inferred_type") == "list[str]" for v in items_vars
         ), (
-            f"Expected inferred_type='list' on 'items' (list[str] -> list), "
+            f"Expected inferred_type='list[str]' on 'items', "
             f"got: {[v.attrs for v in items_vars]}"
         )
 
@@ -1843,3 +1843,52 @@ class TestTypeAnnotations:
             f"Expected animal.speak() -> Dog.speak (via parameter annotation), got CALLS: "
             f"{[(cpg.node(e.source).name, cpg.node(e.target).name) for e in calls_edges]}"
         )
+
+
+class TestUnionTypeAnnotationPreservation:
+    """Generic type annotations (Union[X, Y], Optional[X], Dict[K, V]) must
+    preserve their full text including type arguments."""
+
+    @pytest.fixture()
+    def cpg(self):
+        return _build("union_type_annotations.py")
+
+    def _param_type(self, cpg, param_name: str) -> str | None:
+        params = [n for n in cpg.nodes(kind=NodeKind.PARAMETER) if n.name == param_name]
+        assert params, f"Expected a parameter named '{param_name}'"
+        return params[0].attrs.get("type_annotation")
+
+    def test_union_bracket_syntax_preserved(self, cpg):
+        """Union[int, str] must not be truncated to just 'Union'."""
+        ann = self._param_type(cpg, "x")
+        assert ann == "Union[int, str]", f"Expected 'Union[int, str]', got '{ann}'"
+
+    def test_optional_bracket_syntax_preserved(self, cpg):
+        """Optional[str] must not be truncated to just 'Optional'."""
+        ann = self._param_type(cpg, "y")
+        assert ann == "Optional[str]", f"Expected 'Optional[str]', got '{ann}'"
+
+    def test_pipe_syntax_unchanged(self, cpg):
+        """int | str (PEP 604) should still work as before."""
+        ann = self._param_type(cpg, "z")
+        assert ann == "int | str", f"Expected 'int | str', got '{ann}'"
+
+    def test_pipe_none_syntax_unchanged(self, cpg):
+        """str | None should still work as before."""
+        ann = self._param_type(cpg, "w")
+        assert ann == "str | None", f"Expected 'str | None', got '{ann}'"
+
+    def test_dict_generic_preserved(self, cpg):
+        """Dict[str, int] must not be truncated to just 'Dict'."""
+        ann = self._param_type(cpg, "d")
+        assert ann == "Dict[str, int]", f"Expected 'Dict[str, int]', got '{ann}'"
+
+    def test_list_generic_preserved(self, cpg):
+        """List[str] must not be truncated to just 'List'."""
+        ann = self._param_type(cpg, "items")
+        assert ann == "List[str]", f"Expected 'List[str]', got '{ann}'"
+
+    def test_nested_generic_preserved(self, cpg):
+        """Dict[str, List[int]] must preserve nested generics."""
+        ann = self._param_type(cpg, "data")
+        assert ann == "Dict[str, List[int]]", f"Expected 'Dict[str, List[int]]', got '{ann}'"

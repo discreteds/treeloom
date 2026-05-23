@@ -32,14 +32,6 @@ _LITERAL_TYPES: dict[str, str] = {
 }
 
 
-def _strip_generics(type_str: str) -> str:
-    """Strip generic parameters: 'list[str]' -> 'list', 'Dict[str, int]' -> 'Dict'."""
-    idx = type_str.find("[")
-    if idx != -1:
-        return type_str[:idx]
-    return type_str
-
-
 class PythonVisitor(TreeSitterVisitor):
     """Walks a Python tree-sitter parse tree and emits CPG nodes/edges."""
 
@@ -1125,20 +1117,30 @@ def _make_calls_edge(call_id: NodeId, func_id: NodeId) -> Any:
 
 
 def _extract_type_text(type_node: tree_sitter.Node, source: bytes) -> str | None:
-    """Extract the base type name from a tree-sitter ``type`` node.
+    """Extract the full type annotation text from a tree-sitter ``type`` node.
 
-    Handles simple types (``int``), generic types (``list[str]`` → ``list``),
-    and qualified types (``module.Type`` → ``Type``).
+    Preserves generic parameters (``Optional[str]``, ``Dict[str, int]``) and
+    pipe-union syntax (``int | str``).  For qualified names like
+    ``module.ClassName``, strips the qualifier from the outermost name only.
     """
     text = type_node.text
     if text is None:
         return None
     raw = text.decode("utf-8", errors="replace")
-    base = _strip_generics(raw)
-    # For qualified names like "module.ClassName", take the last component
-    if "." in base:
-        base = base.rsplit(".", 1)[-1]
-    return base if base else None
+    # For qualified names like "module.Type[X]", strip the qualifier but keep
+    # generic args.  Only split on dots outside brackets.
+    depth = 0
+    last_dot = -1
+    for i, ch in enumerate(raw):
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        elif ch == "." and depth == 0:
+            last_dot = i
+    if last_dot != -1:
+        raw = raw[last_dot + 1 :]
+    return raw if raw else None
 
 
 def _extract_single_param_name(
