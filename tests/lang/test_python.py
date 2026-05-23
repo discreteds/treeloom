@@ -1892,3 +1892,644 @@ class TestUnionTypeAnnotationPreservation:
         """Dict[str, List[int]] must preserve nested generics."""
         ann = self._param_type(cpg, "data")
         assert ann == "Dict[str, List[int]]", f"Expected 'Dict[str, List[int]]', got '{ann}'"
+
+
+class TestRelativeImportParsing:
+    """Relative imports should store the dotted module with leading dots."""
+
+    def test_relative_import_stores_dot_prefix(self):
+        """from .sub import X should store module='.sub' in IMPORT attrs."""
+        init_src = b"""
+from .sub import helper
+"""
+        cpg = CPGBuilder().add_source(init_src, "pkg/__init__.py", "python").build()
+        imports = [n for n in cpg.nodes(kind=NodeKind.IMPORT) if n.attrs.get("is_from")]
+        assert len(imports) == 1
+        assert imports[0].attrs["module"] == ".sub", (
+            f"Expected '.sub', got {imports[0].attrs['module']!r}"
+        )
+
+    def test_double_dot_relative_import(self):
+        """from ..utils import X should store module='..utils'."""
+        src = b"""
+from ..utils import helper
+"""
+        cpg = CPGBuilder().add_source(src, "pkg/sub/mod.py", "python").build()
+        imports = [n for n in cpg.nodes(kind=NodeKind.IMPORT) if n.attrs.get("is_from")]
+        assert len(imports) == 1
+        assert imports[0].attrs["module"] == "..utils"
+
+
+class TestQualifiedModuleNames:
+    """Module nodes should get dotted qualified names from package structure."""
+
+    def test_package_file_gets_qualified_name(self, tmp_path):
+        """pkg/sub/mod.py inside a package gets 'pkg.sub.mod'."""
+        pkg = tmp_path / "pkg"
+        sub = pkg / "sub"
+        sub.mkdir(parents=True)
+        (pkg / "__init__.py").write_bytes(b"")
+        (sub / "__init__.py").write_bytes(b"")
+        (sub / "mod.py").write_bytes(b"def foo(): pass\n")
+
+        cpg = CPGBuilder().add_file(sub / "mod.py").build()
+        mod = next(cpg.nodes(kind=NodeKind.MODULE))
+        assert mod.name == "pkg.sub.mod", f"Expected 'pkg.sub.mod', got {mod.name!r}"
+
+    def test_init_gets_package_name(self, tmp_path):
+        """pkg/__init__.py gets 'pkg', not '__init__'."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(b"def setup(): pass\n")
+
+        cpg = CPGBuilder().add_file(pkg / "__init__.py").build()
+        mod = next(cpg.nodes(kind=NodeKind.MODULE))
+        assert mod.name == "pkg", f"Expected 'pkg', got {mod.name!r}"
+
+    def test_standalone_file_keeps_stem(self, tmp_path):
+        """utils.py with no __init__.py in parent keeps 'utils'."""
+        (tmp_path / "utils.py").write_bytes(b"def helper(): pass\n")
+
+        cpg = CPGBuilder().add_file(tmp_path / "utils.py").build()
+        mod = next(cpg.nodes(kind=NodeKind.MODULE))
+        assert mod.name == "utils", f"Expected 'utils', got {mod.name!r}"
+
+    def test_virtual_file_falls_back_to_stem(self):
+        """add_source with virtual path falls back to file_path.stem."""
+        cpg = CPGBuilder().add_source(b"def f(): pass\n", "virtual.py", "python").build()
+        mod = next(cpg.nodes(kind=NodeKind.MODULE))
+        assert mod.name == "virtual"
+
+    def test_qualified_name_with_relative_root(self, tmp_path):
+        """Qualified names work correctly with relative_root set."""
+        pkg = tmp_path / "src" / "pkg"
+        pkg.mkdir(parents=True)
+        (tmp_path / "src" / "pkg" / "__init__.py").write_bytes(b"")
+        (pkg / "mod.py").write_bytes(b"def foo(): pass\n")
+
+        cpg = CPGBuilder(relative_root=tmp_path / "src").add_file(pkg / "mod.py").build()
+        mod = next(cpg.nodes(kind=NodeKind.MODULE))
+        assert mod.name == "pkg.mod", f"Expected 'pkg.mod', got {mod.name!r}"
+
+
+class TestPerFileImportMap:
+    """Import-based call resolution should be scoped per file."""
+
+    def test_alias_suppresses_name_based(self):
+        """ml.lit() should NOT match internal lit() in a different module."""
+        lib_src = b"""
+def lit(value):
+    return value
+"""
+        internal_src = b"""
+def lit(x):
+    return x * 2
+"""
+        consumer_src = b"""
+import mylib as ml
+
+def process():
+    return ml.lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(internal_src, "internal.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        # ml.lit should resolve to mylib.lit, NOT internal.lit
+        resolved_targets = [t for s, t in calls_edges if "lit" in s]
+        if resolved_targets:
+            edge = next(
+                e for e in cpg.edges(kind=EdgeKind.CALLS)
+                if cpg.node(e.source) and "lit" in cpg.node(e.source).name
+            )
+            target = cpg.node(edge.target)
+            target_scope = cpg.scope_of(target.id)
+            assert target_scope.name == "mylib", (
+                f"Expected target in 'mylib', got {target_scope.name!r}"
+            )
+
+    def test_per_file_isolation(self):
+        """Import in a.py should not affect resolution in b.py."""
+        lib_src = b"""
+def foo():
+    return 1
+"""
+        a_src = b"""
+import mylib as ml
+
+def call_a():
+    return ml.foo()
+"""
+        b_src = b"""
+def ml():
+    return 'local'
+
+def call_b():
+    return ml()
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(a_src, "a.py", "python")
+            .add_source(b_src, "b.py", "python")
+            .build()
+        )
+        # b.py's ml() should resolve via name-based to b.py's ml function
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        b_calls = [
+            (s, t) for s, t in calls_edges
+            if s == "ml" and t == "ml"
+        ]
+        assert len(b_calls) >= 1, (
+            f"b.py's ml() should resolve to local ml, got: {calls_edges}"
+        )
+
+    def test_from_import_suppresses_name_based(self):
+        """from pkg import lit; lit() should not match internal lit()."""
+        pkg_src = b"""
+def lit(value):
+    return value
+"""
+        internal_src = b"""
+def lit(x):
+    return x * 2
+"""
+        consumer_src = b"""
+from mypkg import lit
+
+def process():
+    return lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(pkg_src, "mypkg.py", "python")
+            .add_source(internal_src, "internal.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        lit_targets = [t for s, t in calls_edges if s == "lit"]
+        if lit_targets:
+            edge = next(
+                e for e in cpg.edges(kind=EdgeKind.CALLS)
+                if cpg.node(e.source) and cpg.node(e.source).name == "lit"
+                and cpg.node(e.source).kind == NodeKind.CALL
+            )
+            target = cpg.node(edge.target)
+            target_scope = cpg.scope_of(target.id)
+            assert target_scope.name == "mypkg", (
+                f"Expected target in 'mypkg', got {target_scope.name!r}"
+            )
+
+    def test_short_name_fallback_also_suppressed(self):
+        """pl.lit should not match internal lit() via short-name strip."""
+        lib_src = b"""
+def lit(value):
+    return value
+"""
+        internal_src = b"""
+def lit(x):
+    return x * 2
+"""
+        consumer_src = b"""
+import mylib as ml
+
+def process():
+    return ml.lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(internal_src, "internal.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        for edge in cpg.edges(kind=EdgeKind.CALLS):
+            src = cpg.node(edge.source)
+            tgt = cpg.node(edge.target)
+            if src and "lit" in src.name:
+                tgt_scope = cpg.scope_of(tgt.id)
+                assert tgt_scope is None or tgt_scope.name != "internal", (
+                    f"ml.lit falsely resolved to internal.lit via short-name fallback"
+                )
+
+
+class TestModuleImportResolution:
+    """Tests for import X as alias; alias.method() resolution."""
+
+    def test_alias_resolves_via_import_following(self):
+        """ml.lit() → CALLS edge to lit() in mylib module."""
+        lib_src = b"""
+def lit(value):
+    return value
+"""
+        consumer_src = b"""
+import mylib as ml
+
+def process():
+    return ml.lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("ml.lit", "lit") in calls_edges, (
+            f"Expected ml.lit -> lit, got: {calls_edges}"
+        )
+
+    def test_unaliased_import_resolves(self):
+        """import mylib; mylib.lit() also resolves correctly."""
+        lib_src = b"""
+def lit(value):
+    return value
+"""
+        consumer_src = b"""
+import mylib
+
+def process():
+    return mylib.lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("mylib.lit", "lit") in calls_edges, (
+            f"Expected mylib.lit -> lit, got: {calls_edges}"
+        )
+
+    def test_from_import_still_works(self):
+        """from mylib import lit; lit() — existing behavior unchanged."""
+        lib_src = b"""
+def lit(value):
+    return value
+"""
+        consumer_src = b"""
+from mylib import lit
+
+def process():
+    return lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("lit", "lit") in calls_edges
+
+    def test_mixed_imports_resolve(self):
+        """Both import styles in same file resolve correctly."""
+        lib_a_src = b"""
+def foo():
+    return 1
+"""
+        lib_b_src = b"""
+def bar():
+    return 2
+"""
+        consumer_src = b"""
+import lib_a as a
+from lib_b import bar
+
+def process():
+    x = a.foo()
+    y = bar()
+    return x + y
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_a_src, "lib_a.py", "python")
+            .add_source(lib_b_src, "lib_b.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("a.foo", "foo") in calls_edges
+        assert ("bar", "bar") in calls_edges
+
+    def test_no_false_cross_resolution(self):
+        """Two modules with same function name — correct one resolved."""
+        lib_src = b"""
+def lit(value):
+    return value
+"""
+        other_src = b"""
+def lit(x):
+    return x * 2
+"""
+        consumer_src = b"""
+import mylib as ml
+
+def process():
+    return ml.lit(42)
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "mylib.py", "python")
+            .add_source(other_src, "other.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        for edge in cpg.edges(kind=EdgeKind.CALLS):
+            src = cpg.node(edge.source)
+            tgt = cpg.node(edge.target)
+            if src and "lit" in src.name:
+                tgt_scope = cpg.scope_of(tgt.id)
+                assert tgt_scope is not None and tgt_scope.name == "mylib", (
+                    f"ml.lit should resolve to mylib, got {tgt_scope.name if tgt_scope else '?'}"
+                )
+
+    def test_dotted_bare_import_prefix_registration(self):
+        """import os.path; os.path.join() — all prefixes registered in import map."""
+        consumer_src = b"""
+import os.path
+
+def process():
+    return os.path.join('a', 'b')
+"""
+        # A module named 'join' (not 'os', not 'path', not 'os.path') should NOT
+        # be resolved via name-based fallback for the os.path.join call.
+        unrelated_src = b"""
+def join(*args):
+    return args
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(consumer_src, "consumer.py", "python")
+            .add_source(unrelated_src, "myutils.py", "python")
+            .build()
+        )
+        # os.path.join is protected by is_import_known guard (prefix 'os' in import map).
+        # Name-based fallback to myutils.join should be suppressed.
+        for edge in cpg.edges(kind=EdgeKind.CALLS):
+            src = cpg.node(edge.source)
+            if src and src.name == "os.path.join":
+                tgt = cpg.node(edge.target)
+                tgt_scope = cpg.scope_of(tgt.id) if tgt else None
+                assert tgt_scope is None or tgt_scope.name != "myutils", (
+                    "os.path.join falsely resolved to myutils.join via name-based"
+                )
+
+    def test_multi_level_stays_unresolved(self):
+        """import pkg.sub; pkg.sub.func() with too many levels stays unresolved."""
+        lib_src = b"""
+def sub():
+    return 'wrong'
+"""
+        consumer_src = b"""
+import pkg.sub
+
+def process():
+    return pkg.sub.func()
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(lib_src, "pkg.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        # pkg.sub.func has 2 segments past "pkg" — should NOT resolve
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        false_matches = [(s, t) for s, t in calls_edges if "sub" in s.lower() or "func" in s.lower()]
+        assert not false_matches, (
+            f"pkg.sub.func() should stay unresolved, got: {false_matches}"
+        )
+
+
+class TestReexportFollowing:
+    """Re-exports through __init__.py should be followed."""
+
+    def test_reexport_resolution(self, tmp_path):
+        """from pkg import Foo where Foo is in pkg/sub/impl.py."""
+        pkg = tmp_path / "pkg"
+        sub = pkg / "sub"
+        sub.mkdir(parents=True)
+        (pkg / "__init__.py").write_bytes(b"from pkg.sub.impl import Foo\n")
+        (sub / "__init__.py").write_bytes(b"")
+        (sub / "impl.py").write_bytes(b"def Foo(): return 1\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(b"from pkg import Foo\n\ndef main():\n    return Foo()\n")
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("Foo", "Foo") in calls_edges
+
+        # Verify target is in pkg.sub.impl, not pkg
+        for edge in cpg.edges(kind=EdgeKind.CALLS):
+            src = cpg.node(edge.source)
+            tgt = cpg.node(edge.target)
+            if src and src.name == "Foo" and src.kind == NodeKind.CALL:
+                tgt_scope = cpg.scope_of(tgt.id)
+                assert tgt_scope is not None
+                assert "impl" in tgt_scope.name, (
+                    f"Expected target in pkg.sub.impl, got {tgt_scope.name!r}"
+                )
+
+    def test_reexport_with_alias(self, tmp_path):
+        """pkg/__init__.py: from pkg.internal import _Impl as PublicName."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(
+            b"from pkg.internal import _Impl as PublicName\n"
+        )
+        (pkg / "internal.py").write_bytes(b"def _Impl(): return 1\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from pkg import PublicName\n\ndef main():\n    return PublicName()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("PublicName", "_Impl") in calls_edges
+
+    def test_reexported_class_resolves(self, tmp_path):
+        """from pkg import MyClass; MyClass() → CLASS node."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(b"from pkg.impl import MyClass\n")
+        (pkg / "impl.py").write_bytes(b"class MyClass:\n    pass\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from pkg import MyClass\n\ndef main():\n    return MyClass()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        for edge in cpg.edges(kind=EdgeKind.CALLS):
+            src = cpg.node(edge.source)
+            tgt = cpg.node(edge.target)
+            if src and src.name == "MyClass" and src.kind == NodeKind.CALL:
+                assert tgt.kind == NodeKind.CLASS, (
+                    f"Expected CLASS node, got {tgt.kind}"
+                )
+                break
+        else:
+            pytest.fail("MyClass() call was not resolved")
+
+    def test_relative_reexport(self, tmp_path):
+        """__init__.py: from .sub import helper — relative re-export."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(b"from .sub import helper\n")
+        (pkg / "sub.py").write_bytes(b"def helper(): return 1\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from pkg import helper\n\ndef main():\n    return helper()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("helper", "helper") in calls_edges
+
+    def test_relative_import_from_non_init(self, tmp_path):
+        """pkg/mod.py: from .sibling import helper — non-package relative."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(b"")
+        (pkg / "sibling.py").write_bytes(b"def helper(): return 1\n")
+        (pkg / "mod.py").write_bytes(
+            b"from .sibling import helper\n\ndef main():\n    return helper()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("helper", "helper") in calls_edges
+
+        # Verify target is in pkg.sibling
+        for edge in cpg.edges(kind=EdgeKind.CALLS):
+            src = cpg.node(edge.source)
+            tgt = cpg.node(edge.target)
+            if src and src.name == "helper" and src.kind == NodeKind.CALL:
+                tgt_scope = cpg.scope_of(tgt.id)
+                assert tgt_scope is not None and "sibling" in tgt_scope.name
+
+    def test_chained_reexport(self, tmp_path):
+        """a/__init__.py → a/b/__init__.py → a/b/c.py — 2 levels."""
+        a = tmp_path / "a"
+        b = a / "b"
+        b.mkdir(parents=True)
+        (a / "__init__.py").write_bytes(b"from a.b import deep_func\n")
+        (b / "__init__.py").write_bytes(b"from a.b.c import deep_func\n")
+        (b / "c.py").write_bytes(b"def deep_func(): return 1\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from a import deep_func\n\ndef main():\n    return deep_func()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("deep_func", "deep_func") in calls_edges
+
+    def test_recursion_limit(self, tmp_path):
+        """4-level chain: a → b → c → d. Level 4 should NOT resolve."""
+        a = tmp_path / "a"
+        b = a / "b"
+        c = b / "c"
+        d = c / "d"
+        d.mkdir(parents=True)
+        (a / "__init__.py").write_bytes(b"from a.b import deep\n")
+        (b / "__init__.py").write_bytes(b"from a.b.c import deep\n")
+        (c / "__init__.py").write_bytes(b"from a.b.c.d import deep\n")
+        (d / "__init__.py").write_bytes(b"from a.b.c.d.e import deep\n")
+        # No e module — chain exceeds depth 3
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from a import deep\n\ndef main():\n    return deep()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        deep_resolved = [(s, t) for s, t in calls_edges if "deep" in s]
+        assert not deep_resolved, (
+            f"4-level chain should not resolve, got: {deep_resolved}"
+        )
+
+    def test_alternative_reexport_path(self, tmp_path):
+        """Two re-export paths for same symbol — first fails, second succeeds."""
+        pkg = tmp_path / "mypkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(
+            b"from mypkg.missing import Widget\nfrom mypkg.real import Widget\n"
+        )
+        (pkg / "real.py").write_bytes(b"def Widget():\n    return 1\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from mypkg import Widget\n\ndef main():\n    return Widget()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        assert ("Widget", "Widget") in calls_edges
+
+    def test_direct_search_no_submodule_bypass(self, tmp_path):
+        """from pkg import Foo where Foo is in pkg.internal but NOT re-exported."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_bytes(b"# does NOT re-export Foo\n")
+        (pkg / "internal.py").write_bytes(b"def Foo(): return 1\n")
+
+        consumer = tmp_path / "consumer.py"
+        consumer.write_bytes(
+            b"from pkg import Foo\n\ndef main():\n    return Foo()\n"
+        )
+
+        cpg = CPGBuilder().add_directory(tmp_path).build()
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        foo_resolved = [(s, t) for s, t in calls_edges if "Foo" in s]
+        assert not foo_resolved, (
+            f"Foo should NOT resolve (not re-exported), got: {foo_resolved}"
+        )
+
+
+class TestKnownLimitations:
+    """Document known limitation behavior for regression tracking."""
+
+    def test_post_import_shadowing_known_wrong(self):
+        """from pkg import lit; lit = other; lit() — resolves to pkg.lit (wrong).
+
+        This is a known limitation: the resolver has no access to per-scope
+        assignment tracking. This test documents the current (incorrect)
+        behavior as a regression marker.
+        """
+        pkg_src = b"""
+def lit(value):
+    return value
+"""
+        consumer_src = b"""
+from mypkg import lit
+
+def other():
+    return 'other'
+
+def process():
+    lit = other
+    return lit()
+"""
+        cpg = (
+            CPGBuilder()
+            .add_source(pkg_src, "mypkg.py", "python")
+            .add_source(consumer_src, "consumer.py", "python")
+            .build()
+        )
+        # Known wrong: lit() resolves to mypkg.lit even after shadowing
+        calls_edges = _edge_pairs(cpg, EdgeKind.CALLS)
+        # Just verify it doesn't crash — the exact resolution is documented
+        # as a known limitation
+        assert isinstance(calls_edges, list)

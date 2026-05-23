@@ -45,6 +45,39 @@ class PythonVisitor(TreeSitterVisitor):
     def extensions(self) -> frozenset[str]:
         return frozenset({".py", ".pyi"})
 
+    @staticmethod
+    def _derive_qualified_module_name(file_path: Path) -> str:
+        """Derive a dotted module name from a file path.
+
+        Walks up the directory tree checking for __init__.py to find the
+        package root. Falls back to file_path.stem for non-package files
+        or virtual paths that don't exist on disk.
+        """
+        try:
+            resolved = file_path.resolve()
+        except (OSError, ValueError):
+            return file_path.stem
+
+        if not resolved.exists():
+            return file_path.stem
+
+        parts: list[str] = []
+        is_init = file_path.name == "__init__.py"
+
+        if not is_init:
+            parts.append(file_path.stem)
+
+        current = resolved.parent
+        while (current / "__init__.py").exists():
+            parts.append(current.name)
+            current = current.parent
+
+        if not parts:
+            return file_path.stem
+
+        parts.reverse()
+        return ".".join(parts)
+
     def visit(
         self, tree: Any, file_path: Path, emitter: NodeEmitter
     ) -> None:
@@ -53,8 +86,12 @@ class PythonVisitor(TreeSitterVisitor):
         source = root.text
 
         module_end = self._end_location(root, file_path)
+        # Prefer the original disk path (before relative-root normalization)
+        # for package-structure discovery; fall back to file_path if not available.
+        original_path = getattr(emitter, "_current_original_path", None) or file_path
+        module_name = self._derive_qualified_module_name(original_path)
         module_id = emitter.emit_module(
-            file_path.stem, file_path,
+            module_name, file_path,
             end_location=module_end,
         )
         ctx = _VisitContext(emitter=emitter, file_path=file_path, source=source)
@@ -97,17 +134,49 @@ class PythonVisitor(TreeSitterVisitor):
             if scope is not None and scope.kind == NodeKind.CLASS:
                 method_index[(scope.name, fn.name)] = fn
 
-        # Build import map: local_name -> (module_name, original_name)
-        # This lets us resolve calls to imported functions by finding them
-        # in the CPG under their original module scope.
-        import_map: dict[str, tuple[str, str]] = {}
+        # -- Per-file import maps ----------------------------------------
+        file_import_maps: dict[str, dict[str, tuple[str, str | None]]] = {}
+        module_imports: dict[NodeId, list[CpgNode]] = {}
         for imp_node in cpg.nodes(kind=NodeKind.IMPORT):
+            # Per-file import map
+            file_key = str(imp_node.location.file) if imp_node.location else ""
+            if file_key not in file_import_maps:
+                file_import_maps[file_key] = {}
+            fmap = file_import_maps[file_key]
+
             if imp_node.attrs.get("is_from"):
                 module = imp_node.attrs.get("module", "")
                 for imp_name in imp_node.attrs.get("names", []):
                     aliases = imp_node.attrs.get("aliases") or {}
                     local = aliases.get(imp_name, imp_name)
-                    import_map[local] = (module, imp_name)
+                    fmap[local] = (module, imp_name)
+            else:
+                for name in imp_node.attrs.get("names", []):
+                    aliases = imp_node.attrs.get("aliases") or {}
+                    local = aliases.get(name, name)
+                    fmap[local] = (name, None)
+                    if "." in name and name not in aliases:
+                        parts = name.split(".")
+                        for i in range(1, len(parts)):
+                            prefix = ".".join(parts[:i])
+                            fmap.setdefault(prefix, (prefix, None))
+
+            # Module-scoped import index
+            scope_node = cpg.scope_of(imp_node.id)
+            if scope_node is not None:
+                module_imports.setdefault(scope_node.id, []).append(imp_node)
+
+        # Symbol index: functions + classes
+        symbols: dict[str, list[CpgNode]] = {}
+        for n in fn_list:
+            symbols.setdefault(n.name, []).append(n)
+        for n in cpg.nodes(kind=NodeKind.CLASS):
+            symbols.setdefault(n.name, []).append(n)
+
+        # Module name index
+        module_index: dict[str, CpgNode] = {}
+        for n in cpg.nodes(kind=NodeKind.MODULE):
+            module_index[n.name] = n
 
         resolved: list[tuple[NodeId, NodeId]] = []
 
@@ -124,32 +193,101 @@ class PythonVisitor(TreeSitterVisitor):
                     method_index, class_nodes,
                 )
 
-            # Fall back to name-based resolution
-            if fn is None:
+            # Per-file import map for this call's file
+            call_file = str(call_node.location.file) if call_node.location else ""
+            call_import_map = file_import_maps.get(call_file, {})
+
+            is_import_known = (
+                target in call_import_map
+                or ("." in target and target.split(".")[0] in call_import_map)
+            )
+
+            # Name-based fallback — guarded
+            if fn is None and not is_import_known:
                 fn = self._resolve_single_call(
                     call_node, target, functions, cpg,
                 )
 
-            if fn is None and "." in target:
+            if fn is None and not is_import_known and "." in target:
                 short_name = target.rsplit(".", 1)[-1]
                 fn = self._resolve_single_call(
                     call_node, short_name, functions, cpg,
                 )
 
-            # Try import-following: if the call target was imported, look
-            # for the function in the source module's scope
-            if fn is None and target in import_map:
-                imp_module, imp_name = import_map[target]
-                # Find candidates with the original name scoped in the right module
-                imp_candidates = functions.get(imp_name, [])
-                for candidate in imp_candidates:
-                    scope = cpg.scope_of(candidate.id)
-                    if scope is not None and scope.kind == NodeKind.MODULE:
-                        # Match module name (stem, e.g. "utils" matches "utils.py")
-                        mod_parts = imp_module.rsplit(".", 1)
-                        if scope.name == imp_module or scope.name in mod_parts:
-                            fn = candidate
+            # Import-following resolution
+            if fn is None:
+                imp_entry = call_import_map.get(target)
+                base_method: str | None = None
+
+                # Longest-prefix lookup for dotted calls
+                if imp_entry is None and "." in target:
+                    parts = target.split(".")
+                    for i in range(len(parts) - 1, 0, -1):
+                        prefix = ".".join(parts[:i])
+                        imp_entry = call_import_map.get(prefix)
+                        if imp_entry is not None:
+                            remaining = parts[i:]
+                            if len(remaining) == 1:
+                                base_method = remaining[0]
+                            else:
+                                imp_entry = None
                             break
+
+                if imp_entry is not None:
+                    imp_module, imp_name = imp_entry
+
+                    # Resolve relative imports to absolute module names
+                    if imp_module.startswith("."):
+                        # Find the module containing this call
+                        call_scope = call_node
+                        calling_module: CpgNode | None = None
+                        while call_scope is not None:
+                            parent = cpg.scope_of(call_scope.id)
+                            if parent is not None and parent.kind == NodeKind.MODULE:
+                                calling_module = parent
+                                break
+                            call_scope = parent
+                        if calling_module is not None:
+                            is_pkg = (
+                                calling_module.location is not None
+                                and str(calling_module.location.file).endswith(
+                                    "__init__.py"
+                                )
+                            )
+                            imp_module = self._resolve_relative_import(
+                                calling_module.name, imp_module, is_package=is_pkg
+                            )
+
+                    if imp_name is not None:
+                        # From-import: search for symbol in exact module
+                        imp_candidates = symbols.get(imp_name, [])
+                        imp_mod_parts = imp_module.rsplit(".", 1)
+                        for candidate in imp_candidates:
+                            scope = cpg.scope_of(candidate.id)
+                            if scope is not None and scope.kind == NodeKind.MODULE:
+                                if scope.name == imp_module or scope.name in imp_mod_parts:
+                                    fn = candidate
+                                    break
+                        if fn is None:
+                            fn = self._follow_reexport(
+                                cpg, imp_module, imp_name, symbols,
+                                module_imports, module_index,
+                            )
+                    elif base_method is not None:
+                        # Module import: search for method in exact module
+                        candidates = symbols.get(base_method, [])
+                        imp_mod_parts = imp_module.rsplit(".", 1)
+                        for candidate in candidates:
+                            scope = cpg.scope_of(candidate.id)
+                            if scope is not None and scope.kind == NodeKind.MODULE:
+                                if scope.name == imp_module or scope.name in imp_mod_parts:
+                                    fn = candidate
+                                    break
+                        if fn is None:
+                            fn = self._follow_reexport(
+                                cpg, imp_module, base_method, symbols,
+                                module_imports, module_index,
+                            )
 
             if fn is not None:
                 cpg.add_edge(_make_calls_edge(call_node.id, fn.id))
@@ -217,6 +355,78 @@ class PythonVisitor(TreeSitterVisitor):
 
         # Fall back to first match (best-effort)
         return candidates[0]
+
+    @staticmethod
+    def _is_submodule(name: str, parent: str) -> bool:
+        """Check if name is a submodule of parent."""
+        return name.startswith(parent + ".")
+
+    def _follow_reexport(
+        self,
+        cpg: CodePropertyGraph,
+        module_name: str,
+        symbol_name: str,
+        symbols: dict[str, list[CpgNode]],
+        module_imports: dict[NodeId, list[CpgNode]],
+        module_index: dict[str, CpgNode],
+        _depth: int = 0,
+    ) -> CpgNode | None:
+        """Follow __init__.py re-exports to find the actual definition."""
+        if _depth >= 3:
+            return None
+
+        module_node = module_index.get(module_name)
+        if module_node is None:
+            return None
+
+        for imp in module_imports.get(module_node.id, []):
+            if not imp.attrs.get("is_from"):
+                continue
+            source_module = imp.attrs.get("module", "")
+
+            if source_module.startswith("."):
+                is_pkg = (
+                    module_node.location is not None
+                    and str(module_node.location.file).endswith("__init__.py")
+                )
+                source_module = self._resolve_relative_import(
+                    module_name, source_module, is_package=is_pkg
+                )
+
+            names = imp.attrs.get("names", [])
+            aliases = imp.attrs.get("aliases") or {}
+            for name in names:
+                local = aliases.get(name, name)
+                if local == symbol_name or name == symbol_name:
+                    candidates = symbols.get(name, [])
+                    for candidate in candidates:
+                        scope = cpg.scope_of(candidate.id)
+                        if scope and scope.kind == NodeKind.MODULE:
+                            if (scope.name == source_module
+                                    or self._is_submodule(scope.name, source_module)):
+                                return candidate
+                    result = self._follow_reexport(
+                        cpg, source_module, name, symbols,
+                        module_imports, module_index, _depth + 1,
+                    )
+                    if result is not None:
+                        return result
+        return None
+
+    @staticmethod
+    def _resolve_relative_import(
+        importing_module: str, relative_module: str, is_package: bool
+    ) -> str:
+        """Resolve a relative import against the importing module's name."""
+        dots = len(relative_module) - len(relative_module.lstrip("."))
+        suffix = relative_module.lstrip(".")
+        parts = importing_module.split(".")
+        if not is_package and parts:
+            parts = parts[:-1]
+        base_parts = parts[: max(0, len(parts) - (dots - 1))]
+        if suffix:
+            base_parts.append(suffix)
+        return ".".join(base_parts)
 
     # -- Private visit dispatch -----------------------------------------------
 
@@ -526,6 +736,12 @@ class PythonVisitor(TreeSitterVisitor):
                 continue
             if child.type == "import":
                 saw_import = True
+                continue
+            if child.type == "relative_import":
+                # tree-sitter emits: relative_import → import_prefix ('.') + dotted_name
+                text = self._node_text(child, ctx.source)
+                if not saw_import:
+                    module_name = text
                 continue
             if child.type == "dotted_name":
                 text = self._node_text(child, ctx.source)

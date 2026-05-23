@@ -73,6 +73,7 @@ class CPGBuilder:
             relative_root.resolve() if relative_root is not None else None
         )
         self._include_source = include_source
+        self._current_original_path: Path | None = None
 
     @staticmethod
     def _file_hash(path: Path) -> str:
@@ -1054,7 +1055,8 @@ class CPGBuilder:
             warnings.warn(f"Cannot read {file_path}: {e}", stacklevel=2)
             return
 
-        self._parse_and_visit(source_bytes, self._normalize_path(file_path), visitor)
+        self._parse_and_visit(source_bytes, self._normalize_path(file_path), visitor,
+                              original_path=file_path)
 
     def _process_source(
         self, source: bytes, filename: str, language: str | None, registry: Any
@@ -1079,8 +1081,20 @@ class CPGBuilder:
 
         self._parse_and_visit(source, self._normalize_path(Path(filename)), visitor)
 
-    def _parse_and_visit(self, source: bytes, file_path: Path, visitor: Any) -> None:
-        """Run the parse and visit phases for one file."""
+    def _parse_and_visit(
+        self,
+        source: bytes,
+        file_path: Path,
+        visitor: Any,
+        *,
+        original_path: Path | None = None,
+    ) -> None:
+        """Run the parse and visit phases for one file.
+
+        *original_path* is the absolute disk path before relative-root
+        normalization.  Visitors may use it for package-structure discovery
+        (e.g. walking up to find ``__init__.py`` files).
+        """
         try:
             tree = visitor.parse(source, str(file_path))
         except Exception as e:
@@ -1095,10 +1109,16 @@ class CPGBuilder:
                 )
                 return
 
+        # Stash the original disk path so visitors can discover package
+        # structure even when the stored file_path has been normalized.
+        self._current_original_path = original_path
+
         try:
             visitor.visit(tree, file_path, self)
         except Exception as e:
             warnings.warn(f"Visit error for {file_path}: {e}", stacklevel=2)
+        finally:
+            self._current_original_path = None
 
 
 def _matches_any(path: Path, root: Path, patterns: list[str]) -> bool:
